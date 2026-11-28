@@ -270,14 +270,13 @@ architecture behavior of main is
 
 -- Message Transmission. The syn_keep and nomerge reduce code size 
 -- slightly.
-	signal TXI, -- Transmit Initiate
-		TXWP, -- Transmit Warmup
-		TXA, -- Transmit Active
+	signal TXRQ, -- Transmit Request
+		TXACK, -- Transmit Acknowledge
 		TXB, -- Transmit Bit
 		FHI -- Frequency High
 		: boolean := false;
-	attribute syn_keep of TXI, TXA : signal is true;
-	attribute nomerge of TXI, TXA : signal is "";  
+	attribute syn_keep of TXRQ, TXACK : signal is true;
+	attribute nomerge of TXRQ, TXACK : signal is "";  
 	constant max_chan_num : positive := 255;
 	signal td_chan : natural range 0 to max_chan_num;
 	constant frequency_step : positive := 1; 
@@ -364,7 +363,7 @@ begin
 -- our acquisition or dispatch processes are not equal.
 	FCKEN <= (ADCRQ xor ADCACK) or (TDRQ xor TDACK) 
 		or (CMDRQ xor CMDACK) or (BOOTRQ xor BOOTACK)
-		or (SRRQ xor SRACK);
+		or (SRRQ xor SRACK) or (TXRQ xor TXACK);
 	Fast_Clock : entity ring_oscillator 
 		generic map (
 			num_gates => fck_num_gates,
@@ -499,7 +498,9 @@ begin
 	);
 
 -- The ADC Reader is an acquisition process called by the Sensor 
--- Reader. It runs off the falling edge of PCK. It starts up when-- it seesl ADCRQ xor ADCACK. When the ADCCAL flag is set, the reader
+-- Reader. It runs off the falling edge of PCK. It starts up when-- it sees ADCRQ xor ADCACK. The Fast Clock (FCK) also starts up
+-- when ADCRQ xor ADCACK, so the Processor Clock (PCK) that drives
+-- the reader will be running. When the ADCCAL flag is set, the reader
 -- performs an extra-long read that initiates the ADC self-calibration
 -- provided that this is the first ADC read after power-up. At all other
 -- times, the reader performs a fourteen-bit sample read. To prepare for
@@ -741,6 +742,7 @@ begin
 				mcu_data_in(2) <= to_std_logic(BOOTRQ xor BOOTACK);
 				mcu_data_in(3) <= to_std_logic(SRRQ xor SRACK);
 				mcu_data_in(4) <= to_std_logic(ADCRQ xor ADCACK);
+				mcu_data_in(5) <= to_std_logic(TXRQ xor TXACK);
 				
 			-- The status register provides information about the state of
 			-- peripheral logic and memories. The bit assignments are
@@ -770,12 +772,12 @@ begin
 		-- signals, but not all.
 		if (RESET = '1') then
 			df_reg <= (others => '0');
-			TXI <= false;
 			TDACK <= false;
 			BOOTACK <= false;
 			CMDACK <= false;
 			SRACK <= false;
 			ADCRQ <= false;
+			TXRQ <= false;
 			SDWRSM <= '0';
 			SDRSTACC <= '0';
 			SDSHSD <= false;
@@ -793,7 +795,6 @@ begin
 			DC <= '0';
 		elsif rising_edge(PCK) then
 			REBOOT <= false;
-			TXI <= false;
 			SDWRSM <= '0';
 			SDRSTACC <= '0';
 			SDSHSD <= false;
@@ -842,8 +843,8 @@ begin
 					else
 						if (mcu_addr(4) = '1') then
 						
-							-- The dispatch acknowledge bits, canonical offset 
-							-- mmu_dack.
+							-- The dispatch acknowledge and request bits. Canonical 
+							-- offset mmu_dack.
 							if (mcu_addr(0) = '1') then
 								if (mcu_data_out(0) = '1') then
 									TDACK <= TDRQ;
@@ -859,6 +860,9 @@ begin
 								end if;
 								if (mcu_data_out(4) = '1') then
 									ADCRQ <= not ADCRQ;
+								end if;
+								if (mcu_data_out(5) = '1') then
+									TXRQ <= not TXRQ;
 								end if;
 							end if;
 							
@@ -900,13 +904,10 @@ begin
 								adc_shift <= to_integer(unsigned(mcu_data_out(2 downto 0)));
 							end if;
 							
-							-- The telemetry channel number register. When written, not
-							-- only sets the channel number that will be used by the next
-							-- message transmission but also initiates that transmission.
-							-- Canonical offset mmu_xch.
+							-- The telemetry channel number register. Canonical offset 
+							-- mmu_xch.
 							if (mcu_addr(1) = '1') then
 								td_chan <= to_integer(unsigned(mcu_data_out));
-								TXI <= true;
 							end if;
 							
 							-- The radio-frequency calibration value. Will be written on
@@ -959,9 +960,13 @@ begin
 		end if;
 	end process;
 
--- The Message Transmitter responds to Transmit Initiate (TXI) by turning on the 
--- radio-frequency oscillator, reading sixteen bits from one of the sensors and
--- transmitting the bits. The process runs off TCK, which is FCK divided by two,-- so FCK must be running.
+-- The Message Transmitter starts when it sees TXRQ xor TXACK. It turns on
+-- the radio-frequency oscillator and transmits the sixteen top bits at the
+-- output of the sample memory on the telemetry channel number given by 
+-- td_chan. The transmitter runs off TCK so as to produce the telemetry
+-- protocol's required 5 MBPS transmission rate. Thus, FCK must be running
+-- so as to provide TCK. Clock FCK will be running when TXRQ xor TXACK 
+-- as well. When done, the transmitter toggles.
 	Message_Transmitter : process (all) is
 		variable chan_num, set_num, completion_code : 
 			natural range 0 to 15; -- set number for data
@@ -994,25 +999,22 @@ begin
 		-- Upon startup, we make sure we are in the idle state.
 		if (RESET = '1') then 
 			state := 0;
-			TXA <= false;
+			TXACK <= false;
 		elsif rising_edge(TCK) then
-			-- The process starts when we assert TXI. We move through all 
+			-- The process starts when we assert TXRQ. We move through all 
 			-- subsequent states until we reach the final state, where we 
-			-- wait until TXI is un-asserted for our return to the idle state. 
+			-- wait until TXRQ is un-asserted for our return to the idle state. 
 			case state is
 				when mt_idle => 
-					if TXI then
+					if (TXRQ xor TXACK) then
 						next_state := 1;
 					else
 						next_state := 0;
 					end if;
 				
 				when mt_done =>
-					if not TXI then
-						next_state := mt_idle;
-					else
-						next_state := mt_done;
-					end if;
+					TXACK <= TXRQ;
+					next_state := mt_idle;
 				
 				when others =>
 					next_state := state + 1;
@@ -1045,17 +1047,14 @@ begin
 				or ((state = first_cc_bit + 2) and (cc_bits(1) = '1'))
 				or ((state = first_cc_bit + 3) and (cc_bits(0) = '1'));
 				
-			-- TXA indicates that a transmission is on-going.
-			TXA <= (state /= mt_idle) and (state /= mt_done);
-			
 			-- Assert the next state value.
 			state := next_state;
 		end if;
 	end process;
 
--- With XEN we enable the VCO. We assert XEN while Transmit Active (TXA) or 
+-- With XEN we enable the VCO. We assert XEN while Transmit Active (TXACK) or 
 -- Transmit Warm-Up (TXWP), but only if not Command Processor Receive (CPRCV).
-	XEN <= to_std_logic((not CMDRCV) and (TXA or TXWP));
+	XEN <= to_std_logic((not CMDRCV) and (TXRQ xor TXACK));
 			
 -- The Frequency Modulation process takes the transmit bit values provided by
 -- the Message Transmitter, turns them into a sequence of rising and falling
@@ -1077,7 +1076,7 @@ begin
 		
 			-- When we are not transmitting RF power, we set the DAC output to
 			-- zero so as to eliminate current consumption by the DAC resistors.
-			if not TXA then
+			if not TXACK then
 				xdac <= (others => '0');
 				FHI <= false;
 				

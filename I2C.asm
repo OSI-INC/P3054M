@@ -76,7 +76,7 @@ nop
 ld (mmu_i2cZ0),A
 sub A,(1)
 jp nz,i2c_rx_bit
-ld A,(mmu_i2cMR)
+ld A,(mmu_i2cin)
 ret
 
 ; Shared transaction prefix: START, device+W, sub-address.
