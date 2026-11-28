@@ -131,6 +131,8 @@ architecture behavior of main is
 	signal fck_mask : fck_mask_type;
 	attribute syn_keep of TCK, FCK, PCK, MCK, FCKEN, fck_mask : signal is true;
 	attribute nomerge of TCK, FCK, PCK, MCK, FCKEN, fck_mask : signal is ""; 
+	attribute syn_keep of fck_mask : signal is true;
+	attribute nomerge of fck_mask : signal is ""; 
 
 -- Sample Memory Locations
 	constant smem_addr_len : positive := 4;
@@ -268,15 +270,12 @@ architecture behavior of main is
 		: std_logic;
 	signal sd_addr : smem_addr_type; -- Software Dispatcher Sample Select
 
--- Message Transmission. The syn_keep and nomerge reduce code size 
--- slightly.
+-- Message Transmission.
 	signal TXRQ, -- Transmit Request
 		TXACK, -- Transmit Acknowledge
 		TXB, -- Transmit Bit
 		FHI -- Frequency High
 		: boolean := false;
-	attribute syn_keep of TXRQ, TXACK : signal is true;
-	attribute nomerge of TXRQ, TXACK : signal is "";  
 	constant max_chan_num : positive := 255;
 	signal td_chan : natural range 0 to max_chan_num;
 	constant frequency_step : positive := 1; 
@@ -966,7 +965,7 @@ begin
 -- td_chan. The transmitter runs off TCK so as to produce the telemetry
 -- protocol's required 5 MBPS transmission rate. Thus, FCK must be running
 -- so as to provide TCK. Clock FCK will be running when TXRQ xor TXACK 
--- as well. When done, the transmitter toggles.
+-- as well. When done, the transmitter set TXACK equal to TXRQ.
 	Message_Transmitter : process (all) is
 		variable chan_num, set_num, completion_code : 
 			natural range 0 to 15; -- set number for data
@@ -1001,9 +1000,10 @@ begin
 			state := 0;
 			TXACK <= false;
 		elsif rising_edge(TCK) then
-			-- The process starts when we assert TXRQ. We move through all 
-			-- subsequent states until we reach the final state, where we 
-			-- wait until TXRQ is un-asserted for our return to the idle state. 
+		
+			-- The process starts when TXRQ and TXACK are unequal. We move
+			-- through all subsequent states until we reach the final state,
+			-- where we set TXACK equal to TXRQ and return to the idle state.
 			case state is
 				when mt_idle => 
 					if (TXRQ xor TXACK) then
@@ -1052,8 +1052,8 @@ begin
 		end if;
 	end process;
 
--- With XEN we enable the VCO. We assert XEN while Transmit Active (TXACK) or 
--- Transmit Warm-Up (TXWP), but only if not Command Processor Receive (CPRCV).
+-- With XEN we enable the VCO. We assert XEN whenever a transmission
+-- request is pending, provided we are not receiving a command.
 	XEN <= to_std_logic((not CMDRCV) and (TXRQ xor TXACK));
 			
 -- The Frequency Modulation process takes the transmit bit values provided by
@@ -1076,7 +1076,7 @@ begin
 		
 			-- When we are not transmitting RF power, we set the DAC output to
 			-- zero so as to eliminate current consumption by the DAC resistors.
-			if not TXACK then
+			if (TXRQ = TXACK) then
 				xdac <= (others => '0');
 				FHI <= false;
 				

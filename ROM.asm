@@ -1,9 +1,9 @@
 ; Control Register Locations.
 
-const mmu_irqb  0x0201
+const mmu_drq   0x0201
 const mmu_sr    0x0202
 const mmu_i2cin 0x0203
-const mmu_irst  0x0211
+const mmu_dack  0x0211
 const mmu_sacc  0x0212
 const mmu_cmp   0x0214
 const mmu_saddr 0x0218
@@ -44,53 +44,80 @@ include "I2C.asm"
 
 main:
 
+; Acknowledge the boot request.
+
+ld A,(0x04)
+ld (mmu_dack),A
+
 ; Main Loop.
 
 main_loop:
 
-; Check the Telemetry Dispatch bit.
+; Check the Telemetry Dispatch Request.
 
 check_dispatch:
-ld A,(mmu_irqb)
+ld A,(mmu_drq)
 and A,(0x01)
+jp z,check_srd
+
+; Select sample memory location zero for X1, 
+; set the channel number, and start the 
+; transmission.
+
+ld A,(0x00)
+ld (mmu_saddr),A
+ld A,(1)
+ld (mmu_xch),A
+ld A,(0x20)
+ld (mmu_dack),A
+
+; Wait for transmission to complete.
+
+tx_wait:
+ld A,(mmu_drq)
+and A,(0x20)
+jp nz,tx_wait
+
+; Reset sample accumulator and write zero to the
+; sample memory. Acknowledge the dispatch request.
+
+ld A,(0x01)
+ld (mmu_sacc),A
+ld A,(0x02)
+ld (mmu_sacc),A
+ld A,(0x01)
+ld (mmu_dack),A
+
+; Check for Sensor Read Request.
+
+check_srd:
+ld A,(mmu_drq)
+and A,(0x08)
 jp z,check_cmd
 
-; Select sample memory location zero, take
-; control of the sample memory and initiate
-; transmission on channel one.
+; Set sample address to zero for X1, set the 
+; shift count, initiate conversion.
 
 ld A,(0)
 ld (mmu_saddr),A
 ld A,(4)
-ld (mmu_sacc),A
-ld A,(1)
-ld (mmu_xch),A
+ld (mmu_shift),A
+ld A,(0x10)
+ld (mmu_dack),A
 
-; Wait for transmission to complete.
+; Wait for conversion and storage to complete.
 
-ld A,(20)
-tx_wait:
-sub A,(1)
-jp nz,tx_wait
+srd_wait:
+ld A,(mmu_drq)
+and A,(0x10)
+jp nz,srd_wait
 
-; Reset sample accumulator, write zero to the
-; sample memory, and return sample memory to
-; the Telemetry Manager. Acknowledge the dispatch
-; request.
+; Acknowledge the sensor read request.
 
-ld A,(5)
-ld (mmu_sacc),A
-ld A,(6)
-ld (mmu_sacc),A
-ld A,(0)
-ld (mmu_sacc),A
-ld A,(1)
-ld (mmu_irst),A
-
-; Check for incoming commmand.
+ld A,(0x08)
+ld (mmu_dack),A
 
 check_cmd:
-
 
 jp main
 
