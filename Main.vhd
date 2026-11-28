@@ -207,19 +207,19 @@ architecture behavior of main is
 -- code to access each register, but we do not use these addresses 
 -- in our MMU decoder. We can add new registers, but we must do so 
 -- in a manner consistent with the MMU decoder, and choose a canonical 
--- addresses that selects only the new read or write register, or else 
+-- address that selects only the new read or write register, or else 
 -- we will find we are writing to multiple registers at the same time.
 
 -- MMU Read Registers. The first one is the command memory portal, which
--- is a read-write register that we can read from canonical address 0x00,
--- but which we must write to at address 0x14. We define mmu_cmp in the
+-- is a read-write register that we can read from canonical offset 0x00,
+-- but which we must write to at offset 0x14. We define mmu_cmp in the
 -- group-one registers instead of among the the read registers.
 	constant mmu_drq   : natural := 16#01#; -- Dispatch Request Bits
 	constant mmu_sr    : natural := 16#02#; -- Status Register
 	constant mmu_i2cin : natural := 16#03#; -- I2C Input Data
 
 -- MMU Write Registers, Group One.
-	constant mmu_dack  : natural := 16#11#; -- Dispatch Acknowlege Bits
+	constant mmu_dack  : natural := 16#11#; -- Dispatch Acknowledge Bits
 	constant mmu_sacc  : natural := 16#12#; -- Sample Accumulator Control
 	constant mmu_cmp   : natural := 16#14#; -- Command Memory Portal
 	constant mmu_saddr : natural := 16#18#; -- Sample Memory Address
@@ -720,7 +720,7 @@ begin
 			-- Our command memory portal. We read from this location to 
 			-- obtain the output of the command memory. To increment the 
 			-- command memory address and get the next byte we write to the
-			-- same register. We use canonical address mmu_cmp.
+			-- same register. We use canonical offset mmu_cmp.
 			when "00" =>
 				mcu_data_in <= cmd_out;
 				
@@ -731,7 +731,7 @@ begin
 			-- acknowlege flag. Others are tasks the Software Dispatcher
 			-- itself has requested and their status is represented by one 
 			-- of the bits. The ADCRQ signal, for example, is one that is
-			-- toggle by the Software Dispatcher to start the ADC Reader, 
+			-- toggled by the Software Dispatcher to start the ADC Reader, 
 			-- while the TDRQ signal is toggled by the Telemetry Scheduler to
 			-- instruct the Software Dispatcher to transmit pending messages.
 			-- Canonical address mmu_drq.
@@ -813,11 +813,11 @@ begin
 					-- We select our I2C control registers with the top bit of our control
 					-- address. Each of these registers provides a different drive state
 					-- for the SDA and SCL pins. One instruction drives the top data bit
-					-- onto onto SDA. Another shifts SDA into the I2C input register that
+					-- onto SDA. Another shifts SDA into the I2C input register that
 					-- we can read from a separate location. The behavior of each of the
 					-- two bits and the shift register are determined by dedicated address
 					-- bits. This use of address bits as control signals simplifies our 
-					-- logic. See the canonical address table for the assembler code 
+					-- logic. See the canonical offset table for the assembler code 
 					-- locations of the I2C control registers and the register individual
 					-- functions.
 					if (mcu_addr(7) = '1') then
@@ -842,7 +842,7 @@ begin
 					else
 						if (mcu_addr(4) = '1') then
 						
-							-- The dispatch acknowledge bits, canonical address 
+							-- The dispatch acknowledge bits, canonical offset 
 							-- mmu_dack.
 							if (mcu_addr(0) = '1') then
 								if (mcu_data_out(0) = '1') then
@@ -863,7 +863,7 @@ begin
 							end if;
 							
 							-- The sample accumulator control register. Canonical
-							-- address mmu_sacc.
+							-- offset mmu_sacc.
 							if (mcu_addr(1) = '1') then
 								SDRSTACC <= mcu_data_out(0);					
 								SDWRSM <= mcu_data_out(1);
@@ -876,14 +876,14 @@ begin
 							-- read-write register. A write to this address causes
 							-- the command memory to produce another byte at its 
 							-- output, which can be read from the same location. 
-							-- Canonical address mmu_cmp.
+							-- Canonical offset mmu_cmp.
 							if (mcu_addr(2) = '1') then
 								CMRD <= '1';
 							end if;
 							
-							-- The sample memory address registser. Selects one of
+							-- The sample memory address register. Selects one of
 							-- the sample memory locations for output and
-							-- accumulation. Canonical address mmu_saddr.
+							-- accumulation. Canonical offset mmu_saddr.
 							if (mcu_addr(3) = '1') then
 								sd_addr <= mcu_data_out(smem_addr_len-1 downto 0);
 							end if;
@@ -895,7 +895,7 @@ begin
 						
 							-- The number of left-shifts to apply to incoming fourteen-
 							-- bit ADC samples before accumulation in the sample memory.
-							-- Canonical address mmu_shift.
+							-- Canonical offset mmu_shift.
 							if (mcu_addr(0) = '1') then
 								adc_shift <= to_integer(unsigned(mcu_data_out(2 downto 0)));
 							end if;
@@ -903,20 +903,20 @@ begin
 							-- The telemetry channel number register. When written, not
 							-- only sets the channel number that will be used by the next
 							-- message transmission but also initiates that transmission.
-							-- Canonical address mmu_xch.
+							-- Canonical offset mmu_xch.
 							if (mcu_addr(1) = '1') then
 								td_chan <= to_integer(unsigned(mcu_data_out));
 								TXI <= true;
 							end if;
 							
 							-- The radio-frequency calibration value. Will be written on
-							-- boot with a value read from NVM. Canonical address mmu_rfc.
+							-- boot with a value read from NVM. Canonical offset mmu_rfc.
 							if (mcu_addr(2) = '1') then
 								rf_calib <= to_integer(unsigned(mcu_data_out(4 downto 0)));
 							end if;
 							
 							-- The fast clock calibration mask. Will be written on boot
-							-- with a value read from NVM. Canonical address mmu_fck.
+							-- with a value read from NVM. Canonical offset mmu_fck.
 							if (mcu_addr(3) = '1') then
 								fck_mask <= mcu_data_out;
 							end if;
@@ -928,27 +928,27 @@ begin
 						
 							-- The diagnostic flag register. A way of bringing test 
 							-- signals out from the microcontroller processes to device
-							-- pins for debugging and calibration. Canonical address
+							-- pins for debugging and calibration. Canonical offset
 							-- mmu_dfr.
 							if (mcu_addr(0) = '1') then
 								df_reg <= mcu_data_out(3 downto 0);
 							end if;
 							
 							-- Software-generated reboot register. Any write to this 
-							-- register causes a reboot. Canonical address mmu_rst.
+							-- register causes a reboot. Canonical offset mmu_rst.
 							if (mcu_addr(1) = '1') then
 								REBOOT <= true;
 							end if;
 							
 							-- Amplifier control register. Sets AC/DC coupling and 
 							-- closes impedance measurement switch with separate bits.
-							-- Canonical address mmu_acfg.
+							-- Canonical offset mmu_acfg.
 							if (mcu_addr(2) = '1') then
 								DC <= mcu_data_out(0);
 								MSR <= mcu_data_out(1);
 							end if;
 							
-							-- Indicator lamp control. Canonical address mmu_led.
+							-- Indicator lamp control. Canonical offset mmu_led.
 							if (mcu_addr(3) = '1') then
 								LED <= mcu_data_out(2);
 							end if;
