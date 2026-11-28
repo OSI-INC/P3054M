@@ -119,6 +119,6 @@ ld (mmu_dack),A
 
 check_cmd:
 
-jp main
+jp main_loop
 
 
