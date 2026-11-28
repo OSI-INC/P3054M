@@ -114,11 +114,11 @@ architecture behavior of main is
 	attribute syn_keep of RESET : signal is true;
 	attribute nomerge of RESET : signal is "";
 	signal SFLAG, STDBY : std_logic;
-	signal SWRST : boolean := false;
+	signal REBOOT : boolean := false;
 	
--- Configuration and Calibration Signals
-	constant PURQ : boolean := true;
-	signal PUACK : boolean := false;	
+-- Boot-Up Signals
+	constant BOOTRQ : boolean := true;
+	signal BOOTACK : boolean := false;	
 	
 -- Ring Oscillator, Fast Clock, and Transmit Clock. We want the 
 -- compiler to preserve the fck_mask bits or else FCK period will 
@@ -181,22 +181,47 @@ architecture behavior of main is
 	constant mmu_cmd_top   : natural := 16#03FF#;
 	constant mmu_ram_len   : positive := 5; -- Process RAM Address Length
 	
--- Control register addresses are partially decoded. Read access
--- is selected by address bits 1 and 0. Write access with bit 7
--- set controls the I2C interface. Otherwise, bits 6 to 4 select
--- register groups and bits 3 to 0 select registers within each
--- group. Use the canonical addresses below to avoid unintended
--- simultaneous writes to multiple registers.
+-- Our assignment of addresses to control registers is designed
+-- to simplify the selection of registers by the Memory Management
+-- Unit (MMU). We have 256 control space locations and fewer than
+-- 32 control registers. Read-only registers should never overlap,-- but they can each appear in multiple locations within the
+-- control space. Write-only registers can overlap, but there must
+-- be at least one location in the control space that selects only 
+-- that particular write-only register. A read-only register can
+-- overlap with multiple write-only registers because the Write
+-- Data Strobe (WDS) signal provided by the microcontroller will 
+-- prevent write-only registers from being written on read cycles,-- and we do not allow read-only registers to act like strobes for
+-- peripheral logic. That is: reading from a control register must
+-- not generate a handshake, counter increment, or register shift. 
+-- If we want to have read registers act as strobes for peripheral
+-- logic, we must use the Read Data Strobe (RDS) provided by the 
+-- microcontroller. We are refraining from using RDS so that the 
+-- compiler can eliminate the signal and reduce logic size. We have 
+-- eight available address lines, A7-A0. We divide the control 
+-- registers into read-only and write-only. The read registers we
+-- select with A1-A0 regardless of A7-A2 because we have only four 
+-- read registers. On a write access, A7=1 selects the I2C control 
+-- registers. When A7=0, A6-A4 each select one of three register 
+-- groups, while A3-A0 each select one of four registers within each 
+-- group. The table below gives addresses we can use in assembler 
+-- code to access each register, but we do not use these addresses 
+-- in our MMU decoder. We can add new registers, but we must do so 
+-- in a manner consistent with the MMU decoder, and choose a canonical 
+-- addresses that selects only the new read or write register, or else 
+-- we will find we are writing to multiple registers at the same time.
 
--- MMU Read Registers.
-	constant mmu_irqb  : natural := 16#01#; -- Interrupt Request Bits
+-- MMU Read Registers. The first one is the command memory portal, which
+-- is a read-write register that we can read from canonical address 0x00,
+-- but which we must write to at address 0x14. We define mmu_cmp in the
+-- group-one registers instead of among the the read registers.
+	constant mmu_drq   : natural := 16#01#; -- Dispatch Request Bits
 	constant mmu_sr    : natural := 16#02#; -- Status Register
-	constant mmu_i2cMR : natural := 16#03#; -- I2C Most Recent Eight Bits
+	constant mmu_i2cin : natural := 16#03#; -- I2C Input Data
 
 -- MMU Write Registers, Group One.
-	constant mmu_irst  : natural := 16#11#; -- Interrupt Reset Bits
+	constant mmu_dack  : natural := 16#11#; -- Dispatch Acknowlege Bits
 	constant mmu_sacc  : natural := 16#12#; -- Sample Accumulator Control
-	constant mmu_cmp   : natural := 16#14#; -- Command Memory Portal (Read/Write)
+	constant mmu_cmp   : natural := 16#14#; -- Command Memory Portal
 	constant mmu_saddr : natural := 16#18#; -- Sample Memory Address
 
 -- MMU Write Registers, Group Two.
@@ -208,6 +233,8 @@ architecture behavior of main is
 -- MMU Write Registers, Group Three.
 	constant mmu_dfr   : natural := 16#41#; -- Diagnostic Flags
 	constant mmu_rst   : natural := 16#42#; -- Software Reset
+	constant mmu_acfg  : natural := 16#44#; -- Amplifier Configuration
+	constant mmu_led   : natural := 16#48#; -- Lamp Control
 
 -- MMU I2C Write Registers.
 	constant mmu_i2c00 : natural := 16#80#; -- SDA=0 SCL=0
@@ -321,9 +348,8 @@ begin
 		if falling_edge(RCK) then
 			CLRFLAG <= to_std_logic(state = clr_state);
 			USERSTDBY <= to_std_logic(state >= stdby_state);
-			RESET <= to_std_logic((state < end_state) or SWRST);
+			RESET <= to_std_logic((state < end_state) or REBOOT);
 			LV <= to_std_logic(state = end_state);
-			LED <= to_std_logic(state < end_state);
 
 			if (state < stdby_state) then state := state + 1;
 			elsif (SFLAG = '0') then state := stdby_state;
@@ -337,7 +363,7 @@ begin
 -- enabled whenever the request and acknowledgment signals of one of
 -- our acquisition or dispatch processes are not equal.
 	FCKEN <= (ADCRQ xor ADCACK) or (TDRQ xor TDACK) 
-		or (CMDRQ xor CMDACK) or (PURQ xor PUACK)
+		or (CMDRQ xor CMDACK) or (BOOTRQ xor BOOTACK)
 		or (SRRQ xor SRACK);
 	Fast_Clock : entity ring_oscillator 
 		generic map (
@@ -670,30 +696,73 @@ begin
 		-- for writing to control registers.
 		mcu_data_in <= (others => '0');
 		case full_addr is
+		
+		-- The constant-supplying address space takes the address lines
+		-- and feeds them back into the data bus so as to provide a
+		-- library of constants 0x00 to 0xFF by reading from the same
+		-- locations within the constant block.
 		when mmu_const_bot to mmu_const_top =>
 			mcu_data_in <= mcu_addr(7 downto 0);
+			
+		-- The process RAM space is 256 bytes, which may be many times
+		-- larger than the available RAM locations. On write cycles we
+		-- perform a synchronous write on the rising edge of PCK with
+		-- Write Data Strobe (WDS).
 		when mmu_ram_bot to mmu_ram_top =>
 			mcu_data_in <= ram_data;
 			RAMWR <= to_std_logic(WDS);
+			
+		-- Read-Only Registers. We have four of these. Their addresses
+		-- overlap with write-only registers, but not with one another.
 		when mmu_ctrl_bot to mmu_ctrl_top =>
 			case mcu_addr(1 downto 0) is
+			
+			-- Our command memory portal. We read from this location to 
+			-- obtain the output of the command memory. To increment the 
+			-- command memory address and get the next byte we write to the
+			-- same register. We use canonical address mmu_cmp.
 			when "00" =>
 				mcu_data_in <= cmd_out;
+				
+			-- The dispatch request bit register. Here we have bits that
+			-- show the Software Dispatcher what tasks have been requested
+			-- and are not yet complete. Some of these the Software Dispatcher
+			-- will respond to by performing the task and later toggling an
+			-- acknowlege flag. Others are tasks the Software Dispatcher
+			-- itself has requested and their status is represented by one 
+			-- of the bits. The ADCRQ signal, for example, is one that is
+			-- toggle by the Software Dispatcher to start the ADC Reader, 
+			-- while the TDRQ signal is toggled by the Telemetry Scheduler to
+			-- instruct the Software Dispatcher to transmit pending messages.
+			-- Canonical address mmu_drq.
 			when "01" =>
 				mcu_data_in(0) <= to_std_logic(TDRQ xor TDACK);
 				mcu_data_in(1) <= to_std_logic(CMDRQ xor CMDACK);
-				mcu_data_in(2) <= to_std_logic(PURQ xor PUACK);
+				mcu_data_in(2) <= to_std_logic(BOOTRQ xor BOOTACK);
 				mcu_data_in(3) <= to_std_logic(SRRQ xor SRACK);
 				mcu_data_in(4) <= to_std_logic(ADCRQ xor ADCACK);
+				
+			-- The status register provides information about the state of
+			-- peripheral logic and memories. The bit assignments are
+			-- consistent with the P3054P firmware. Canonical address mmu_sr.
 			when "10" =>
-				mcu_data_in(6) <= CME;
+				mcu_data_in(2) <= MCK; -- Millisecond Clock 1024 Hz.
+				mcu_data_in(6) <= CME; -- Command Memory Empty
+				mcu_data_in(7) <= RCK; -- Reference Clock 32.768 kHz.
+				
+			-- The I2C input shift register. This byte is filled by the
+			-- SDA bits being shifted into it during I2C read access.
+			-- Canonical address mmu_i2cin.
 			when "11" =>
 				mcu_data_in <= i2c_in;
-			when others =>
-				null;
+				
 			end case;
-		when others =>
+		
+		-- The command memory space is where we might put the incoming
+		-- command in the future.
+		when mmu_cmd_bot to mmu_cmd_top =>
 			null;
+			
 		end case;
 		
 		-- Control register write access memory map. Writes take place on 
@@ -703,7 +772,7 @@ begin
 			df_reg <= (others => '0');
 			TXI <= false;
 			TDACK <= false;
-			PUACK <= false;
+			BOOTACK <= false;
 			CMDACK <= false;
 			SRACK <= false;
 			ADCRQ <= false;
@@ -718,9 +787,12 @@ begin
 			SCL <= '1';
 			rf_calib <= default_rf_calib;
 			fck_mask <= default_fck_mask;
-			SWRST <= false;
+			REBOOT <= false;
+			LED <= '0';
+			MSR <= '0';
+			DC <= '0';
 		elsif rising_edge(PCK) then
-			SWRST <= false;
+			REBOOT <= false;
 			TXI <= false;
 			SDWRSM <= '0';
 			SDRSTACC <= '0';
@@ -728,9 +800,27 @@ begin
 			SDADD <= '0';
 			CMRD <= '0';
 			if (full_addr >= mmu_ctrl_bot) and (full_addr <= mmu_ctrl_top) then
+			
+				-- We are concerned here only with write-only registers, so we make our
+				-- further activity contingent upon WDS asserted. Do not combine this 
+				-- condition with the address restrictions above. For some reason, 
+				-- combining the address restriction and WDS increases the code size
+				-- by 16 LUTs. Furthermore, if we later introduce read-only control 
+				-- registers with strobes, we will need to add a Read Data Strobe (RDS)
+				-- section to this address restriction.
 				if WDS then
+				
+					-- We select our I2C control registers with the top bit of our control
+					-- address. Each of these registers provides a different drive state
+					-- for the SDA and SCL pins. One instruction drives the top data bit
+					-- onto onto SDA. Another shifts SDA into the I2C input register that
+					-- we can read from a separate location. The behavior of each of the
+					-- two bits and the shift register are determined by dedicated address
+					-- bits. This use of address bits as control signals simplifies our 
+					-- logic. See the canonical address table for the assembler code 
+					-- locations of the I2C control registers and the register individual
+					-- functions.
 					if (mcu_addr(7) = '1') then
-						-- I2C Control.
 						SCL <= mcu_addr(0);
 
 						if (mcu_addr(2) = '1')
@@ -747,9 +837,13 @@ begin
 							i2c_in(0) <= SDA;
 						end if;
 
+					-- Write-Only Register Group One. Selected whenever address bit 
+					-- A4 is HI and bit A7 is LO.
 					else
-						-- Register Group One.
 						if (mcu_addr(4) = '1') then
+						
+							-- The dispatch acknowledge bits, canonical address 
+							-- mmu_dack.
 							if (mcu_addr(0) = '1') then
 								if (mcu_data_out(0) = '1') then
 									TDACK <= TDRQ;
@@ -758,7 +852,7 @@ begin
 									CMDACK <= CMDRQ;
 								end if;
 								if (mcu_data_out(2) = '1') then
-									PUACK <= PURQ;
+									BOOTACK <= BOOTRQ;
 								end if;
 								if (mcu_data_out(3) = '1') then
 									SRACK <= SRRQ;
@@ -767,6 +861,9 @@ begin
 									ADCRQ <= not ADCRQ;
 								end if;
 							end if;
+							
+							-- The sample accumulator control register. Canonical
+							-- address mmu_sacc.
 							if (mcu_addr(1) = '1') then
 								SDRSTACC <= mcu_data_out(0);					
 								SDWRSM <= mcu_data_out(1);
@@ -774,38 +871,86 @@ begin
 								SDADD <= mcu_data_out(3);
 								SDBIT <= mcu_data_out(4);
 							end if;
+							
+							-- The command memory portal, the write-only side of a
+							-- read-write register. A write to this address causes
+							-- the command memory to produce another byte at its 
+							-- output, which can be read from the same location. 
+							-- Canonical address mmu_cmp.
 							if (mcu_addr(2) = '1') then
 								CMRD <= '1';
 							end if;
+							
+							-- The sample memory address registser. Selects one of
+							-- the sample memory locations for output and
+							-- accumulation. Canonical address mmu_saddr.
 							if (mcu_addr(3) = '1') then
 								sd_addr <= mcu_data_out(smem_addr_len-1 downto 0);
 							end if;
 						end if;
 
-						-- Register Group Two.
+						-- Write-Only Register Group Two. Selected whenever address bit 
+						-- A5 is HI and bit A7 is LO.
 						if (mcu_addr(5) = '1') then
+						
+							-- The number of left-shifts to apply to incoming fourteen-
+							-- bit ADC samples before accumulation in the sample memory.
+							-- Canonical address mmu_shift.
 							if (mcu_addr(0) = '1') then
 								adc_shift <= to_integer(unsigned(mcu_data_out(2 downto 0)));
 							end if;
+							
+							-- The telemetry channel number register. When written, not
+							-- only sets the channel number that will be used by the next
+							-- message transmission but also initiates that transmission.
+							-- Canonical address mmu_xch.
 							if (mcu_addr(1) = '1') then
 								td_chan <= to_integer(unsigned(mcu_data_out));
 								TXI <= true;
 							end if;
+							
+							-- The radio-frequency calibration value. Will be written on
+							-- boot with a value read from NVM. Canonical address mmu_rfc.
 							if (mcu_addr(2) = '1') then
 								rf_calib <= to_integer(unsigned(mcu_data_out(4 downto 0)));
 							end if;
+							
+							-- The fast clock calibration mask. Will be written on boot
+							-- with a value read from NVM. Canonical address mmu_fck.
 							if (mcu_addr(3) = '1') then
 								fck_mask <= mcu_data_out;
 							end if;
 						end if;
 
-						-- Register Group Three.
+						-- Write-Only Register Group Three. Selected whenever address bit 
+						-- A6 is HI and bit A7 is LO.
 						if (mcu_addr(6) = '1') then
+						
+							-- The diagnostic flag register. A way of bringing test 
+							-- signals out from the microcontroller processes to device
+							-- pins for debugging and calibration. Canonical address
+							-- mmu_dfr.
 							if (mcu_addr(0) = '1') then
 								df_reg <= mcu_data_out(3 downto 0);
 							end if;
+							
+							-- Software-generated reboot register. Any write to this 
+							-- register causes a reboot. Canonical address mmu_rst.
 							if (mcu_addr(1) = '1') then
-								SWRST <= true;
+								REBOOT <= true;
+							end if;
+							
+							-- Amplifier control register. Sets AC/DC coupling and 
+							-- closes impedance measurement switch with separate bits.
+							-- Canonical address mmu_acfg.
+							if (mcu_addr(2) = '1') then
+								DC <= mcu_data_out(0);
+								MSR <= mcu_data_out(1);
+							end if;
+							
+							-- Indicator lamp control. Canonical address mmu_led.
+							if (mcu_addr(3) = '1') then
+								LED <= mcu_data_out(2);
 							end if;
 						end if;
 					end if;
